@@ -1,50 +1,44 @@
-const CONFIG = {
-  // 默认反代目标
-  defaultTarget: 'https://999020.xyz',
+addEventListener('fetch', event => {
+  event.respondWith(handle(event.request));
+});
 
-  // xhttp 后端，留空就走 defaultTarget
-  xhttpTarget: '',
+const DEFAULT_TARGET = 'https://999020.xyz';
 
-  // httpupgrade 后端，留空就走 defaultTarget
-  httpUpgradeTarget: '',
+// 如果你有单独的 xhttp / httpupgrade 后端，就填这里；没有就先留空
+const XHTTP_TARGET = '';
+const HTTPUPGRADE_TARGET = '';
 
-  // 是否去掉前缀
-  stripXhttpPrefix: false,
-  stripHttpUpgradePrefix: false,
-};
+// 是否去掉前缀
+const STRIP_XHTTP_PREFIX = true;
+const STRIP_HTTPUPGRADE_PREFIX = true;
 
-export async function onRequest(context) {
-  const request = context.request;
-
+async function handle(request) {
   try {
     const reqUrl = new URL(request.url);
 
-    // 调试用：先访问 /__health 看函数是否正常
+    // 健康检查，先确认函数能执行
     if (reqUrl.pathname === '/__health') {
-      return json({
-        ok: true,
-        pathname: reqUrl.pathname,
-        method: request.method,
-        upgrade: request.headers.get('upgrade') || '',
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8' }
       });
     }
 
-    const route = pickRoute(reqUrl.pathname);
-    const target = route.target || CONFIG.defaultTarget;
+    const route = getRoute(reqUrl.pathname);
+    const targetBase = route.target || DEFAULT_TARGET;
 
-    if (!target) {
+    if (!targetBase) {
       return text('target not configured', 500);
     }
 
-    const upstreamUrl = buildUpstreamUrl(reqUrl, target, route);
+    const targetUrl = buildTargetUrl(reqUrl, targetBase, route);
 
     const headers = new Headers(request.headers);
-
-    // 清理容易冲突的头
     headers.delete('host');
     headers.delete('content-length');
 
-    // 普通请求删掉 connection，升级请求尽量保留
+    // 尽量保留 Upgrade 相关头，给 xhttp/httpupgrade 一个尝试机会
+    // 非升级请求就删掉 connection，避免冲突
     if (!request.headers.get('upgrade')) {
       headers.delete('connection');
     }
@@ -54,86 +48,99 @@ export async function onRequest(context) {
 
     const init = {
       method: request.method,
-      headers,
-      redirect: 'manual',
+      headers: headers,
+      redirect: 'manual'
     };
 
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       init.body = request.body;
     }
 
-    // 关键：尽量直接透传，少做处理
-    const upstream = await fetch(upstreamUrl.toString(), init);
+    const upstream = await fetch(targetUrl.toString(), init);
 
-    return upstream;
-  } catch (err) {
-    return text('proxy error\n\n' + (err && err.stack ? err.stack : String(err)), 500);
+    const respHeaders = new Headers(upstream.headers);
+    respHeaders.set('x-proxy-by', 'edgeone-pages');
+
+    // 重写 3xx Location，避免跳回源站
+    rewriteLocation(respHeaders, reqUrl, new URL(targetBase));
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: respHeaders
+    });
+  } catch (e) {
+    return text('proxy error:\n' + String(e && e.stack ? e.stack : e), 500);
   }
 }
 
-function pickRoute(pathname) {
-  if (pathname.startsWith('/xhttp')) {
+function getRoute(pathname) {
+  if (pathname.indexOf('/xhttp') === 0) {
     return {
+      target: XHTTP_TARGET || DEFAULT_TARGET,
       prefix: '/xhttp',
-      target: CONFIG.xhttpTarget,
-      stripPrefix: CONFIG.stripXhttpPrefix,
+      stripPrefix: STRIP_XHTTP_PREFIX
     };
   }
 
-  if (pathname.startsWith('/httpupgrade')) {
+  if (pathname.indexOf('/httpupgrade') === 0) {
     return {
+      target: HTTPUPGRADE_TARGET || DEFAULT_TARGET,
       prefix: '/httpupgrade',
-      target: CONFIG.httpUpgradeTarget,
-      stripPrefix: CONFIG.stripHttpUpgradePrefix,
+      stripPrefix: STRIP_HTTPUPGRADE_PREFIX
     };
   }
 
   return {
+    target: DEFAULT_TARGET,
     prefix: '',
-    target: CONFIG.defaultTarget,
-    stripPrefix: false,
+    stripPrefix: false
   };
 }
 
-function buildUpstreamUrl(reqUrl, target, route) {
-  const base = new URL(target);
+function buildTargetUrl(reqUrl, targetBase, route) {
+  const base = new URL(targetBase);
   let path = reqUrl.pathname;
 
-  if (route.stripPrefix && route.prefix && path.startsWith(route.prefix)) {
+  if (route.stripPrefix && route.prefix && path.indexOf(route.prefix) === 0) {
     path = path.slice(route.prefix.length) || '/';
   }
 
-  if (!path.startsWith('/')) {
+  if (path.charAt(0) !== '/') {
     path = '/' + path;
   }
 
   const url = new URL(base.toString());
   url.pathname = joinPath(base.pathname, path);
   url.search = reqUrl.search;
-
   return url;
 }
 
 function joinPath(a, b) {
   const left = (a || '').endsWith('/') ? (a || '').slice(0, -1) : (a || '');
-  const right = b.startsWith('/') ? b : '/' + b;
+  const right = b.charAt(0) === '/' ? b : '/' + b;
   return (left + right) || '/';
 }
 
-function text(body, status = 200) {
-  return new Response(body, {
-    status,
-    headers: {
-      'content-type': 'text/plain; charset=utf-8',
-    },
-  });
+function rewriteLocation(headers, reqUrl, targetBaseUrl) {
+  const location = headers.get('location');
+  if (!location) return;
+
+  try {
+    const loc = new URL(location, targetBaseUrl.origin);
+    if (loc.host === targetBaseUrl.host) {
+      loc.protocol = reqUrl.protocol;
+      loc.host = reqUrl.host;
+      headers.set('location', loc.toString());
+    }
+  } catch (_) {}
 }
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
+function text(body, status) {
+  return new Response(body, {
+    status: status || 200,
     headers: {
-      'content-type': 'application/json; charset=utf-8',
-    },
+      'content-type': 'text/plain; charset=utf-8'
+    }
   });
 }
